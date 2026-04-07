@@ -3,7 +3,7 @@ from datetime import datetime
 from nicegui import app, ui
 
 from .config import SyncConfig
-from .portal.scanner import VaultScanner
+from .scanner import VaultScanner
 
 
 STATUS_PRIORITY = {

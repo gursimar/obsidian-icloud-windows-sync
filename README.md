@@ -40,12 +40,6 @@ A highly optimized, asynchronous, three-way sync engine designed to solve the no
 
 Portal mode runs the sync engine in the background and shows live file status in a web UI.
 
-### Install with portal extras
-
-```bash
-pip install -e .[portal]
-```
-
 ### Run portal mode
 
 ```bash
