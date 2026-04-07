@@ -3,7 +3,8 @@ import asyncio
 import shutil
 import ctypes
 import platform
-
+import uuid
+from ctypes import wintypes
 from datetime import datetime
 
 # ── Windows API ──────────────────────────────────────────────────
@@ -100,6 +101,18 @@ class DiskIO:
             raise RuntimeError("Disk operations are only supported on Windows.")
         self.config = config
         self.log = logger
+        self._dst_locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_key(self, path):
+        return os.path.normcase(os.path.abspath(path))
+
+    def _get_dst_lock(self, dst):
+        key = self._lock_key(dst)
+        lock = self._dst_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._dst_locks[key] = lock
+        return lock
 
     def set_normal_attributes(self, path: str) -> bool:
         """
@@ -128,86 +141,75 @@ class DiskIO:
             initial_backoff (float, optional): Initial wait time in seconds before retrying. Defaults to 0.25.
         """
         self.log.info("COPYING", f"{self.config.disp(src)} → {self.config.disp(dst)}", level="verbose")
-        ensure_dir(os.path.dirname(dst))
-        tmp = dst + ".tmp"
-
-        if os.path.exists(tmp):
+        async with self._get_dst_lock(dst):
+            ensure_dir(os.path.dirname(dst))
+            tmp = f"{dst}.tmp.{uuid.uuid4().hex}"
             try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        try:
-            await asyncio.to_thread(shutil.copy2, src, tmp)
-        except Exception as e:
-            self.log.error("FAILED", f"Write tmp file {self.config.disp(tmp)}: {e}")
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-            raise
-
-        backoff = initial_backoff
-        attempt = 0
-        while True:
-            try:
-                if os.path.exists(dst):
-                    self.set_normal_attributes(dst)
-                os.replace(tmp, dst)
-                self.log.success("SUCCESS", f"Updated: {self.config.disp(dst)}", level="verbose")
-                return
-            except PermissionError:
-                attempt += 1
-                if attempt >= max_retries:
-                    # Win32 MoveFileEx fallback
-                    try:
-                        ok = MoveFileExW(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
-                        if ok:
-                            self.log.success("SUCCESS", f"MoveFileEx: {self.config.disp(dst)}", level="verbose")
-                            return
-                        self.log.error("FAILED", f"MoveFileEx (err {ctypes.get_last_error()})")
-                    except Exception as exc:
-                        self.log.error("DANGER", f"MoveFileEx exception: {exc}")
-                    # Final brute-force attempt
-                    try:
-                        if os.path.exists(dst):
-
-                            try:
-                                os.remove(dst)
-                            except FileNotFoundError:
-                                pass
-                        os.replace(tmp, dst)
-                        self.log.success("SUCCESS", f"Forced replace: {self.config.disp(dst)}", level="verbose")
-                        return
-                    except Exception as exc:
-                        self.log.error("FAILED", f"Final forced replace failed: {exc}")
-                        try:
-                            if os.path.exists(tmp):
-                                os.remove(tmp)
-                        except Exception:
-                            pass
-                        raise PermissionError(f"Unable to replace {dst}") from exc
-
-                self.set_normal_attributes(dst)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.8, 5.0)
-            except Exception as unexpected:
-                self.log.error("DANGER", f"Unexpected error during replace: {unexpected}")
-                try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except Exception:
-                    pass
+                await asyncio.to_thread(shutil.copy2, src, tmp)
+            except Exception as e:
+                self.log.error("FAILED", f"Write tmp file {self.config.disp(tmp)}: {e}")
                 raise
 
-    async def remove_file(self, path: str, description: str):
-        """
-        Asynchronously removes a file and cleans up empty parent directories.
+            backoff = initial_backoff
+            attempt = 0
+            while True:
+                try:
+                    if os.path.exists(dst):
+                        self.set_normal_attributes(dst)
+                    os.replace(tmp, dst)
+                    self.log.success("SUCCESS", f"Updated: {self.config.disp(dst)}", level="verbose")
+                    return
+                except FileNotFoundError:
+                    # Tmp can disappear if external software (e.g. iCloud) races with us.
+                    attempt += 1
+                    if attempt >= max_retries:
+                        self.log.error("FAILED", f"Temp file vanished repeatedly for {self.config.disp(dst)}")
+                        raise
+                    await asyncio.to_thread(shutil.copy2, src, tmp)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 1.8, 5.0)
+                except PermissionError:
+                    attempt += 1
+                    if attempt >= max_retries:
+                        # Win32 MoveFileEx fallback
+                        try:
+                            ok = MoveFileExW(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+                            if ok:
+                                self.log.success("SUCCESS", f"MoveFileEx: {self.config.disp(dst)}", level="verbose")
+                                return
+                            self.log.error("FAILED", f"MoveFileEx (err {ctypes.get_last_error()})")
+                        except Exception as exc:
+                            self.log.error("DANGER", f"MoveFileEx exception: {exc}")
+                        # Final brute-force attempt
+                        try:
+                            if os.path.exists(dst):
+                                os.remove(dst)
+                            os.replace(tmp, dst)
+                            self.log.success("SUCCESS", f"Forced replace: {self.config.disp(dst)}", level="verbose")
+                            return
+                        except Exception as exc:
+                            self.log.error("FAILED", f"Final forced replace failed: {exc}")
+                            try:
+                                if os.path.exists(tmp):
+                                    os.remove(tmp)
+                            except Exception:
+                                pass
+                            raise PermissionError(f"Unable to replace {dst}") from exc
 
-        Args:
-            path (str): The file path to delete.
-            description (str): A descriptive label for the file (e.g., 'local', 'history') used in log outputs.
-        """
+                    self.set_normal_attributes(dst)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 1.8, 5.0)
+                except Exception as unexpected:
+                    self.log.error("DANGER", f"Unexpected error during replace: {unexpected}")
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except Exception:
+                        pass
+                    raise
+
+    async def remove_file(self, path, description):
+        """Async remove a file and clean up empty parent dirs."""
         try:
             if not os.path.exists(path):
                 return

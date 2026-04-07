@@ -7,6 +7,7 @@ from colorama import Fore
 
 from .logger import colored
 from .disk_io import safe_exists, size_or_zero, safe_mtime, ensure_dir
+from .action_log import SyncActionLog
 
 class SyncEngine:
     """
@@ -28,6 +29,8 @@ class SyncEngine:
         self.hasher = hasher
         self.io = disk_io
         self.duplicates = duplicates
+        self.action_log = SyncActionLog(
+            os.path.join(config.logs_dir, 'sync_actions.json'))
         self.cooldowns: dict[str, float] = {}
         self.active_tasks: set[str] = set()
         self.io_semaphore = asyncio.Semaphore(self.config.max_concurrent_io)
@@ -75,7 +78,7 @@ class SyncEngine:
         Returns:
             set[str]: A set of all relative file paths discovered across Local, iCloud, and History directories.
         """
-        rels = set()
+        rels: dict[str, str] = {}
         cfg = self.config
 
         def collect(current_path: str, base_root: str):
@@ -103,14 +106,21 @@ class SyncEngine:
                             rel = os.path.normpath(os.path.relpath(entry.path, base_root))
                             if cfg.is_ignored(rel):
                                 continue
-                            rels.add(rel)
+                            # Windows/iCloud can surface case-variant duplicates.
+                            # Normalize to one key so we don't sync the same logical path twice.
+                            key = os.path.normcase(rel)
+                            if key in rels and rels[key] != rel:
+                                self.log.warn("CASE DUP",
+                                              f"Merging case-variant paths: {cfg.disp(rels[key])} / {cfg.disp(rel)}",
+                                              level="verbose")
+                            rels[key] = rel
             except FileNotFoundError:
                 pass
 
         collect(cfg.local_vault, cfg.local_vault)
         collect(cfg.icloud_vault, cfg.icloud_vault)
         collect(cfg.history_dir, cfg.history_dir)
-        return rels
+        return set(rels.values())
 
     # ── Per-file sync logic ──────────────────────────────────────
 
@@ -158,6 +168,8 @@ class SyncEngine:
             if H_exists:
                 self.log.warn("REMOVING HISTORY", f"{colored('No local', Fore.RED)} & {colored('No iCloud', Fore.RED)} for {d}", level="important")
                 await self.io.remove_file(history, "history")
+                self.action_log.record(rel_path, 'ORPHANED', 'L and C missing',
+                                       'Removed orphaned history', None)
             # Clean stale state
             if rel_path in self.hasher.state:
                 del self.hasher.state[rel_path]
@@ -172,9 +184,13 @@ class SyncEngine:
                 self.log.custom([" ←", "⚫"], [Fore.RED, Fore.RED], "DELETE", f"{colored('Removing from iCloud', Fore.CYAN)} & history for {d}", rel_path, level="verbose")
                 await self.io.remove_file(icloud, "iCloud")
                 await self.io.remove_file(history, "history")
+                self.action_log.record(rel_path, 'LOCAL_DELETE', 'L missing, C = H',
+                                       'Local deleted → remove C and H', 'L')
             else:
                 self.log.custom([" ↓", "⚪"], [Fore.CYAN, Fore.CYAN], "PULL", f"{colored('Restoring to local', Fore.GREEN)} from iCloud for {d}", rel_path, level="verbose")
                 await self.restore_from_icloud(rel_path)
+                self.action_log.record(rel_path, 'REMOTE_CHANGED_MISSING', 'L missing, C ≠ H',
+                                       'Remote changed while local missing → restore from C', 'C')
             return
 
         # ── iCloud missing, L+H exist ──
@@ -185,9 +201,13 @@ class SyncEngine:
                 self.log.custom([" ←", "⚫"], [Fore.RED, Fore.RED], "DELETE", f"{colored('Removing local', Fore.RED)} & history for {d}", rel_path, level="verbose")
                 await self.io.remove_file(local, "local")
                 await self.io.remove_file(history, "history")
+                self.action_log.record(rel_path, 'REMOTE_DELETE', 'C missing, L = H',
+                                       'iCloud deleted → remove L and H', 'C')
             else:
                 self.log.custom([" ↑", "⚪"], [Fore.GREEN, Fore.GREEN], "PUSH", f"Local changed for {d} -> pushing to iCloud", rel_path, level="verbose")
                 await self.push_to_icloud(rel_path)
+                self.action_log.record(rel_path, 'LOCAL_CHANGED_MISSING', 'C missing, L ≠ H',
+                                       'Local changed while iCloud missing → push L', 'L')
             return
 
         # ── New local file (L only) ──
@@ -202,6 +222,8 @@ class SyncEngine:
                 return
             self.log.custom([" ↑", "⚪"], [Fore.GREEN, Fore.GREEN], "PUSH", f"{colored('Pushing to iCloud', Fore.CYAN)} for {d}", rel_path, level="verbose")
             await self.push_to_icloud(rel_path)
+            self.action_log.record(rel_path, 'NEW_LOCAL', 'L only',
+                                   'New local file → push to C, seed H', 'L')
             return
 
         # ── New iCloud file (C only) ──
@@ -216,6 +238,8 @@ class SyncEngine:
                 return
             self.log.custom([" ↓", "⚪"], [Fore.CYAN, Fore.CYAN], "PULL", f"{colored('Restoring to local', Fore.GREEN)} for {d}", rel_path, level="verbose")
             await self.restore_from_icloud(rel_path)
+            self.action_log.record(rel_path, 'NEW_REMOTE', 'C only',
+                                   'New iCloud file → restore to L, seed H', 'C')
             return
 
         # ── Both sides exist or mixed states ──
@@ -243,10 +267,14 @@ class SyncEngine:
                         self.log.warn("CONFLICT", f"{colored('Local is newer', Fore.YELLOW)}: {d}", level="important")
                         await self.io.create_conflict_duplicate(icloud)
                         await self.push_to_icloud(rel_path)
+                        self.action_log.record(rel_path, 'CONFLICT_INITIAL', 'L ≠ C, H missing',
+                                               'Initial conflict, local newer → push L', 'L')
                     else:
                         self.log.warn("CONFLICT", f"{colored('iCloud is newer', Fore.YELLOW)}: {d}", level="important")
                         await self.io.create_conflict_duplicate(local)
                         await self.restore_from_icloud(rel_path)
+                        self.action_log.record(rel_path, 'CONFLICT_INITIAL', 'L ≠ C, H missing',
+                                               'Initial conflict, iCloud newer → pull C', 'C')
                     return
             elif Lh is not None and size_or_zero(local) >= cfg.min_seed_size(rel_path):
                 await self.io.async_copy(local, history)
@@ -271,12 +299,16 @@ class SyncEngine:
         if L is not None and H is not None and L != H and C == H:
             self.log.custom([" ↑", "⚪"], [Fore.GREEN, Fore.GREEN], "PUSH", f"{colored('Local changed', Fore.GREEN)}, pushing for {d}", rel_path, level="verbose")
             await self.push_to_icloud(rel_path)
+            self.action_log.record(rel_path, 'LOCAL_CHANGED', 'L ≠ H, C = H',
+                                   'Local changed → push L → C, update H', 'L')
             return
 
         # CASE C: iCloud changed
         if C is not None and H is not None and C != H and L == H:
             self.log.custom([" ↓", "⚪"], [Fore.CYAN, Fore.CYAN], "PULL", f"{colored('iCloud changed', Fore.CYAN)}, restoring for {d}", rel_path, level="verbose")
             await self.restore_from_icloud(rel_path)
+            self.action_log.record(rel_path, 'REMOTE_CHANGED', 'C ≠ H, L = H',
+                                   'iCloud changed → pull C → L, update H', 'C')
             return
 
         # CASE D: Both changed (rare)
@@ -290,12 +322,16 @@ class SyncEngine:
             self.log.warn("CONFLICT", f"{colored('Local still changing', Fore.YELLOW)}, choose local: {d}", level="important")
             await self.io.create_conflict_duplicate(icloud)
             await self.push_to_icloud(rel_path)
+            self.action_log.record(rel_path, 'CONFLICT_BOTH', 'L ≠ H, C ≠ H',
+                                   'Both changed, local still changing → push L', 'L')
             return
 
         if C2 is not None and C2 != C:
             self.log.warn("CONFLICT", f"{colored('iCloud still changing', Fore.YELLOW)}, choose iCloud: {d}", level="important")
             await self.io.create_conflict_duplicate(local)
             await self.restore_from_icloud(rel_path)
+            self.action_log.record(rel_path, 'CONFLICT_BOTH', 'L ≠ H, C ≠ H',
+                                   'Both changed, iCloud still changing → pull C', 'C')
             return
 
         if (L2 is not None and C2 is not None and L2 == L and C2 == C and L2 != C2):
@@ -304,11 +340,15 @@ class SyncEngine:
         if not safe_exists(local):
             self.log.custom([" ↓", "🟡"], [Fore.CYAN, Fore.YELLOW], "PULL", f"{colored('Local vanished', Fore.YELLOW)}, restoring from iCloud: {d}", rel_path, level="verbose")
             await self.restore_from_icloud(rel_path)
+            self.action_log.record(rel_path, 'CONFLICT_BOTH', 'L ≠ H, C ≠ H',
+                                   'Both changed, local vanished → pull C', 'C')
             return
 
         if not safe_exists(icloud):
             self.log.custom([" ↑", "🟡"], [Fore.GREEN, Fore.YELLOW], "PUSH", f"{colored('iCloud vanished', Fore.YELLOW)}, pushing local: {d}", rel_path, level="verbose")
             await self.push_to_icloud(rel_path)
+            self.action_log.record(rel_path, 'CONFLICT_BOTH', 'L ≠ H, C ≠ H',
+                                   'Both changed, iCloud vanished → push L', 'L')
             return
 
         # Fallback: mtime comparison
@@ -317,10 +357,14 @@ class SyncEngine:
             self.log.info("CONFLICT", f"{colored('Local is newer', Fore.YELLOW)}, push local: {d}", level="important")
             await self.io.create_conflict_duplicate(icloud)
             await self.push_to_icloud(rel_path)
+            self.action_log.record(rel_path, 'CONFLICT_BOTH', 'L ≠ H, C ≠ H',
+                                   'Both changed, local newer by mtime → push L', 'L')
         else:
             self.log.info("CONFLICT", f"{colored('iCloud is newer', Fore.YELLOW)}, pull iCloud: {d}", level="important")
             await self.io.create_conflict_duplicate(local)
             await self.restore_from_icloud(rel_path)
+            self.action_log.record(rel_path, 'CONFLICT_BOTH', 'L ≠ H, C ≠ H',
+                                   'Both changed, iCloud newer by mtime → pull C', 'C')
 
     # ── Concurrency wrapper ──────────────────────────────────────
 
@@ -407,6 +451,7 @@ class SyncEngine:
                         else:
                             self.log.info("INFO", "Nothing to sync.", level="normal")
                         self.hasher.save_state()
+                        self.action_log.save()
                         self.log.flush()
                         self.log.success("DONE", "One-shot sync complete.", level="normal")
                         break
@@ -419,6 +464,7 @@ class SyncEngine:
                     now_t = time.time()
                     if self.hasher.dirty and now_t - last_save > 5:
                         self.hasher.save_state()
+                        self.action_log.save()
                         self.log.flush()
                         last_save = now_t
                     elif now_t - last_save > 5:
@@ -434,6 +480,7 @@ class SyncEngine:
         except (KeyboardInterrupt, asyncio.CancelledError):
             self.log.warn("INFO", "Shutdown requested, saving state...", level="important")
             self.hasher.save_state()
+            self.action_log.save()
             self.log.flush()
             self.log.success("DONE", "Graceful shutdown complete.", level="important")
             return
