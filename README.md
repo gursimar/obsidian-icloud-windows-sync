@@ -33,6 +33,30 @@ A highly optimized, asynchronous, three-way sync engine designed to solve the no
 
 > Run natively on Windows, not WSL — iCloud placeholders behave incorrectly under WSL.
 
+
+## Portal/ Web UI Mode
+
+![portal mode screenshot](assets/portal-mode.png)
+
+Portal mode runs the sync engine in the background and shows live file status in a web UI.
+
+### Run portal mode
+
+```bash
+obsidian-sync --config config.yaml --portal --port 8384
+```
+
+Or directly:
+
+```bash
+python -m obsidian_sync --config config.yaml --portal --port 8384
+```
+
+Open:
+
+`http://127.0.0.1:8384`
+
+
 ## Project Structure
 
 ```
@@ -43,7 +67,9 @@ src/obsidian_sync/
 ├── disk_io.py       # Atomic copy, delete, Windows API
 ├── hasher.py        # SHA-256 hashing with mtime/size cache
 ├── duplicates.py    # Startup duplicate/conflict scanner
-└── sync_engine.py   # Main loop + three-way sync logic
+├── sync_engine.py   # Main loop + three-way sync logic
+├── portal_nicegui.py# NiceGUI portal UI
+└── portal/scanner.py# Portal data scanner
 ```
 
 ### Modes of Operation
