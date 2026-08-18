@@ -237,7 +237,7 @@ class SyncEngine:
         await self.log.cleanup_old_logs()
         self.log.init_log_file()
         self.validate_config()
-        self.log.startup("DAEMON MODE")
+        self.log.startup("DAEMON MODE" if self.config.run_continuously else "ONE-SHOT MODE")
         self.hasher.load_state()
 
         self.loop = asyncio.get_running_loop()
@@ -248,6 +248,13 @@ class SyncEngine:
         try:
             observer.start()
             await self.seed_existing_files()
+
+            if not self.config.run_continuously:
+                # Wait for every file worker spawned during seeding to finish processing
+                # its queue, then fall through to the shared cleanup in `finally`.
+                if self.file_queues:
+                    await asyncio.gather(*(q.join() for q in self.file_queues.values()))
+                return
 
             while True:
                 try:
