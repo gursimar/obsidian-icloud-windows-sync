@@ -8,6 +8,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .sync_worker import FileSynchronizer
+from .disk_io import safe_mtime, size_or_zero
 
 
 @dataclass(frozen=True)
@@ -160,6 +161,52 @@ class SyncEngine:
             level="verbose",
         )
 
+    def _drain(self, queue: "asyncio.Queue[FileSyncEvent]") -> int:
+        """Discard every queued event for a file; we sync current on-disk state anyway."""
+        drained = 0
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+                queue.task_done()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        return drained
+
+    def _fingerprint(self, rel_path: str) -> tuple:
+        local = os.path.join(self.config.local_vault, rel_path)
+        icloud = os.path.join(self.config.icloud_vault, rel_path)
+        return (safe_mtime(local), size_or_zero(local), safe_mtime(icloud), size_or_zero(icloud))
+
+    async def _wait_for_quiet(self, rel_path: str, queue: "asyncio.Queue[FileSyncEvent]") -> None:
+        """
+        Quiet-period debounce. Obsidian autosaves every ~2s while you type; syncing each
+        save pushes a half-written file to iCloud every few seconds, and iCloud responds by
+        forking conflict copies ("note(1).md", "note 2.md", ...) and eventually dropping
+        the original. So: only act once the file has stopped changing, in BOTH vaults, for
+        `quiet_period` seconds. Any change or new event during the window restarts it,
+        bounded by `quiet_max_wait` so a file that never settles still syncs eventually.
+        """
+        quiet = self.config.quiet_period
+        if quiet <= 0:
+            return
+        before = self._fingerprint(rel_path)
+        waited = 0
+        while True:
+            await asyncio.sleep(quiet)
+            waited += quiet
+            drained = self._drain(queue)
+            after = self._fingerprint(rel_path)
+            if after == before and drained == 0:
+                if waited > quiet:
+                    self.log.info("DEBOUNCE", f"{self.config.disp(rel_path)} quiet after {waited}s", level="normal")
+                return
+            if waited >= self.config.quiet_max_wait:
+                self.log.warn("DEBOUNCE", f"{self.config.disp(rel_path)} still changing after {waited}s; syncing anyway", level="important")
+                return
+            self.log.info("DEBOUNCE", f"{self.config.disp(rel_path)} still changing; waiting another {quiet}s", level="verbose")
+            before = after
+
     async def file_worker(self, rel_path: str):
         queue = self.file_queues[rel_path]
         while True:
@@ -167,12 +214,10 @@ class SyncEngine:
             pending_count = queue.qsize()
             
             # Drain all pending events since we'll sync current state anyway
-            while not queue.empty():
-                try:
-                    queue.get_nowait()
-                    queue.task_done()
-                except asyncio.QueueEmpty:
-                    break
+            pending_count = self._drain(queue)
+            
+            # Wait until the file stops changing before touching either vault.
+            await self._wait_for_quiet(rel_path, queue)
             
             self.active_tasks.add(rel_path)
             try:

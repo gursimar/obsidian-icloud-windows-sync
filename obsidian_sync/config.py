@@ -23,6 +23,12 @@ class SyncConfig:
     poll_interval: int = 2
     stability_window: int = 3
     stabilize_wait: int = 8
+    # Quiet-period debounce: a file must go this many seconds without changing
+    # (in either vault) before it is synced. Editors autosave every ~2s while
+    # typing; pushing each save to iCloud makes iCloud fork conflict copies.
+    quiet_period: int = 20
+    # Upper bound on how long to keep waiting for quiet before syncing anyway.
+    quiet_max_wait: int = 600
     tiny_threshold: int = 8
     max_concurrent_io: int = 50
     # Logging
@@ -72,6 +78,8 @@ class SyncConfig:
             poll_interval=sync.get("poll_interval", 2),
             stability_window=sync.get("stability_window", 3),
             stabilize_wait=sync.get("stabilize_wait", 8),
+            quiet_period=sync.get("quiet_period", 20),
+            quiet_max_wait=sync.get("quiet_max_wait", 600),
             tiny_threshold=sync.get("tiny_threshold", 8),
             max_concurrent_io=sync.get("max_concurrent_io", 50),
             console_level=logging_cfg.get("console_level", "normal"),
@@ -135,6 +143,12 @@ class SyncConfig:
 
         if self.stability_window < 0:
             errors.append(("invalid_value", "critical", "stability_window cannot be negative"))
+
+        if self.quiet_period < 0:
+            errors.append(("invalid_value", "critical", "quiet_period cannot be negative"))
+
+        if self.quiet_max_wait < self.quiet_period:
+            errors.append(("invalid_value", "critical", "quiet_max_wait must be >= quiet_period"))
 
         return errors
 

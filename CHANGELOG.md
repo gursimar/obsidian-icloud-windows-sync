@@ -1,3 +1,11 @@
+## Unreleased (yabo-san fork)
+
+- Quiet-period debounce (`sync.quiet_period`, default 20s; `sync.quiet_max_wait`, default 600s).
+  A file is only synced once it has stopped changing in both vaults for `quiet_period` seconds.
+  Fixes: editor autosaves (Obsidian saves every ~2s while typing) were each pushed to iCloud,
+  which forked the note into `note(1).md` / `note 2.md` ... `note 6.md` and then deleted the
+  original (observed 2026-09-01, 34 pushes of one note in 2.5 minutes).
+
 # Changelog
 
 ## [1.2.0] - 2026-07-05
