@@ -14,6 +14,11 @@ sync:
   stability_window: 3
   stabilize_wait: 8
   tiny_threshold: 8
+  # Seconds a file must stay unchanged (both vaults) before it is synced. Prevents
+  # editor autosaves from being pushed one by one, which makes iCloud fork
+  # conflict copies. 0 disables. quiet_max_wait caps the wait for files that never settle.
+  quiet_period: 20
+  quiet_max_wait: 600
 
 logging:
   console_level: "normal"      # quiet | normal | verbose
