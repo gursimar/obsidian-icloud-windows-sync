@@ -109,6 +109,25 @@ class TestIsSafe:
             assert c.is_safe("C:/fake/file.md") is True
 
 
+class TestShellAvailabilityStatus:
+    def test_probe_does_not_create_console_window(self, checker):
+        import subprocess
+
+        with patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True), \
+             patch.object(subprocess, "run") as run:
+            run.return_value.stdout = "Available on this device\n"
+            assert checker.shell_availability_status("C:/vault/note.md") == "Available on this device"
+        assert run.call_args.kwargs["creationflags"] == 0x08000000
+        assert "-NonInteractive" in run.call_args.args[0]
+        assert run.call_args.kwargs["capture_output"] is True
+
+    def test_probe_timeout_still_returns_unknown(self, checker):
+        import subprocess
+
+        with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("powershell", 3)):
+            assert checker.shell_availability_status("C:/vault/note.md") is None
+
+
 class TestWaitUntilUploaded:
     @pytest.mark.asyncio
     async def test_waits_for_pending_to_clear_before_success(self, checker):

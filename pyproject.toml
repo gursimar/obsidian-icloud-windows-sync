@@ -21,5 +21,8 @@ dependencies = [
 [project.scripts]
 obsidian-sync = "obsidian_sync.__main__:main"
 
+[project.optional-dependencies]
+tray = ["pystray>=0.19.5", "Pillow>=10.0"]
+
 [tool.setuptools.packages.find]
 include = ["obsidian_sync*"]

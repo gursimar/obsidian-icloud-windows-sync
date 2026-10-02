@@ -233,7 +233,7 @@ class SyncEngine:
             if self.should_sync_rel(rel):
                 self.enqueue_file_event(FileSyncEvent("initial", rel))
 
-    async def run(self):
+    async def run(self, stop_event: asyncio.Event | None = None):
         await self.log.cleanup_old_logs()
         self.log.init_log_file()
         self.validate_config()
@@ -249,7 +249,7 @@ class SyncEngine:
             observer.start()
             await self.seed_existing_files()
 
-            while True:
+            while stop_event is None or not stop_event.is_set():
                 try:
                     if not self.active_tasks:
                         self.log.idle()
@@ -265,7 +265,13 @@ class SyncEngine:
                     self.log.error("ERROR", f"Unexpected error in main loop: {outer}")
                     self.log.error("TRACEBACK", traceback.format_exc())
 
-                await asyncio.sleep(self.config.poll_interval)
+                if stop_event is None:
+                    await asyncio.sleep(self.config.poll_interval)
+                else:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=self.config.poll_interval)
+                    except asyncio.TimeoutError:
+                        pass
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             self.log.warn("INFO", "Shutdown requested, saving state...", level="important")
@@ -274,6 +280,7 @@ class SyncEngine:
             observer.join()
             for worker in self.file_workers.values():
                 worker.cancel()
+            await asyncio.gather(*self.file_workers.values(), return_exceptions=True)
             self.hasher.save_state()
             self.log.flush()
             self.log.success("DONE", "Graceful shutdown complete.", level="important")
