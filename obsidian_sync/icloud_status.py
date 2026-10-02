@@ -181,10 +181,11 @@ class ICloudStatusChecker:
 
         try:
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
                 capture_output=True,
                 text=True,
                 timeout=3,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             value = (result.stdout or "").strip()
             return value or None
