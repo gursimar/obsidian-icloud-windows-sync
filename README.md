@@ -71,6 +71,76 @@ In `taskschd.msc` → Create Task:
 
 ---
 
+## Windows system tray (optional)
+
+Install the tray dependencies from the repository:
+
+```powershell
+python -m pip install ".[tray]"
+python -m obsidian_sync --tray --config "C:\Obsidian\my-config.yaml"
+```
+
+The sync engine runs in the same Python process as the icon. The usual console
+command still works without the tray dependencies.
+
+The icon appears automatically when tray mode starts. Right-click it to start or
+stop sync, open the log folder, or quit. Stop keeps the icon available so sync can
+be started again. Quit stops sync and removes the icon. Both request a graceful
+shutdown: file watchers stop, pending workers are
+cancelled, and the hash cache and logs are saved before the worker exits. Start
+creates a fresh worker using the configuration loaded when the tray was opened.
+Reopen the tray to apply configuration changes.
+
+| Icon | Meaning |
+|---|---|
+| Green | Sync worker is running |
+| Gray | Sync is stopped |
+| Orange | Sync is starting or stopping |
+| Red | The worker failed; open the logs, fix the problem, and use Start sync |
+
+Green indicates that the worker is running. It does not confirm that iCloud has
+uploaded every file or that another device has received it. Windows may place the
+icon under the notification area's hidden-icons arrow.
+
+Tray mode skips the interactive duplicate cleanup prompt and preserves those
+files. Run the console command if you want to review that cleanup. Tray mode
+requires `run_continuously: true` and a valid configuration. Relative vault,
+history, and log paths are resolved from the configuration file's folder in tray
+mode, so logon does not depend on a particular working directory.
+
+### Start at Windows logon
+
+Use a permanent Python installation or virtual environment, then run:
+
+```powershell
+python -m obsidian_sync --install-autostart --config "C:\Obsidian\my-config.yaml"
+```
+
+This registers a `pythonw.exe` command under the current user's Windows Run key.
+It takes effect at the next logon, shows no console window, and needs no
+administrator privileges. Paths are stored as absolute paths; keep the Python
+environment and configuration at those locations. Very long commands are rejected
+because Windows Run entries are limited to 260 characters.
+
+Remove the entry before moving the configuration or uninstalling the package:
+
+```powershell
+python -m obsidian_sync --remove-autostart --config "C:\Obsidian\my-config.yaml"
+```
+
+Removal is safe to repeat and does not stop the current process. Disable any older
+scheduled task or startup shortcut when switching to this method. Both console
+and tray launches use a Windows mutex to prevent a second updated instance with
+the same configuration path in the same login session. Configurations that use
+different files must point to separate vaults/history directories.
+
+To launch the tray manually without a console, use `pythonw -X utf8 -m
+obsidian_sync --tray --config "C:\Obsidian\my-config.yaml"`. If the icon does not
+appear, run the regular `python` command in a terminal to see startup errors.
+Autostart can also be disabled in Windows Settings > Apps > Startup.
+
+---
+
 ## How It Works
 
 Three locations are tracked per file:

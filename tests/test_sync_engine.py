@@ -351,6 +351,44 @@ class TestWatcherScopeAndSuppression:
             assert os.path.abspath(cfg.history_dir) not in scheduled_roots
 
 
+class TestGracefulStop:
+    @pytest.mark.asyncio
+    async def test_stop_event_wakes_long_poll_and_cleans_workers(self, engine, cfg):
+        cfg.poll_interval = 60
+        engine.log.cleanup_old_logs = AsyncMock()
+        engine.hasher.save_state = MagicMock()
+        observer = MagicMock()
+        engine.create_observer = MagicMock(return_value=observer)
+        started = asyncio.Event()
+        cleaned = asyncio.Event()
+        stop = asyncio.Event()
+
+        async def pending_sync(rel):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                cleaned.set()
+
+        async def seed():
+            engine.enqueue_file_event(FileSyncEvent("initial", "note.md"))
+            await started.wait()
+
+        engine.seed_existing_files = seed
+        engine.synchronizer.sync_wrapper = pending_sync
+        task = asyncio.create_task(engine.run(stop_event=stop))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        engine.hasher.save_state.side_effect = lambda: pytest.fail("State saved before worker cleanup") if not cleaned.is_set() else None
+        stop.set()
+        await asyncio.wait_for(task, timeout=1)
+        observer.stop.assert_called_once()
+        observer.join.assert_called_once()
+        assert cleaned.is_set()
+        assert all(worker.done() for worker in engine.file_workers.values())
+        engine.hasher.save_state.assert_called_once()
+
+
 #  push_to_icloud / restore_from_icloud
 
 class TestPushRestore:
